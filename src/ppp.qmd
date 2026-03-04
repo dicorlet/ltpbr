@@ -1,0 +1,239 @@
+---
+title: "Untitled"
+format: html
+---
+
+```{python}
+import os
+import whitebox
+import rasterio
+import numpy as np
+import geopandas as gpd
+from shapely.geometry import Point
+import matplotlib.pyplot as plt
+
+
+wbt = whitebox.WhiteboxTools()
+wbt.verbose = True
+```
+
+```{python}
+data_dir = "/Users/dillencorlett/pbr/data"
+
+dem_raw      = os.path.join(data_dir, "bartleson_dem.tif")
+dem_breached = os.path.join(data_dir, "dem_breached_b.tif")
+d8_ptr     = os.path.join(data_dir, "d8_pointer_b.tif")
+d8_acc     = os.path.join(data_dir, "d8_acc_b.tif")
+
+print("Raw DEM exists?", os.path.exists(dem_raw))
+```
+
+```{python}
+# ── Step 1: Breach Depressions ──
+# Carves channels through small sinks/depressions so water can flow downhill.
+# This is preferred over "fill" because it preserves more of the original terrain.
+
+wbt.breach_depressions(dem_raw, dem_breached)
+print("dem_breached exists?", os.path.exists(dem_breached))
+```
+
+```{python}
+# ── Step 2: D8 Pointer (flow direction) ──
+# For each cell, determines which of its 8 neighbours water flows to
+# (the steepest downhill neighbour). Output is a raster of direction codes.
+
+wbt.d8_pointer(dem_breached, d8_ptr)
+print("d8_pointer exists?", os.path.exists(d8_ptr))
+```
+
+```{python}
+# ── Step 3: D8 Flow Accumulation ──
+# Counts how many upstream cells drain through each cell.
+# High values = streams/rivers. The highest value on the edge = pour point.
+
+wbt.d8_flow_accumulation(d8_ptr, d8_acc)
+print("d8_acc exists?", os.path.exists(d8_acc))
+```
+
+```{python}
+# ── Verify everything ──
+for f in [dem_breached, d8_ptr, d8_acc]:
+    print(f"{os.path.basename(f)} exists? {os.path.exists(f)}")
+```
+
+```{python}
+# ── Step 4: Load the accumulation raster ──
+with rasterio.open(d8_acc) as src:
+    acc = src.read(1)
+    transform = src.transform
+    crs = src.crs
+    nodata = src.nodata
+
+# Replace nodata with 0 so it doesn't get picked as max
+if nodata is not None:
+    acc[acc == nodata] = 0
+
+print(f"Raster shape: {acc.shape}")
+print(f"Max accumulation: {acc.max():,.0f}")
+```
+
+```{python}
+# ── Step 5: Load elevation raster (breached DEM for consistency with flow routing) ──
+with rasterio.open(dem_breached) as src:
+    elev = src.read(1).astype(float)
+    elev_nodata = src.nodata
+
+if elev_nodata is not None:
+    elev[elev == elev_nodata] = 0
+
+print(f"Raster shape: {elev.shape}")
+print(f"Max accumulation: {elev.max():,.0f}")
+```
+
+```{python}
+# ── Step 6: Build watershed boundary mask from nodata adjacency ──
+# Since the DEM is clipped to the HUC12 polygon, nodata = outside the watershed.
+# The true outlet candidates are valid cells that border at least one nodata cell —
+# i.e., the inner ring of the watershed polygon boundary.
+
+from scipy.ndimage import binary_dilation
+
+valid_mask  = acc > 0                        # True inside watershed
+nodata_mask = ~valid_mask                    # True outside watershed
+
+# Expand nodata by 1 cell in all directions
+nodata_dilated = binary_dilation(nodata_mask, structure=np.ones((3, 3)))
+
+# Boundary = valid cells that touch nodata
+boundary_mask = valid_mask & nodata_dilated
+
+print(f"Watershed boundary cells: {boundary_mask.sum():,}")
+```
+
+
+```{python}
+# ── 2. Create an edge buffer mask ──
+# "Edge" = within N pixels of the raster boundary
+# Also exclude nodata areas so the pour point is on a real flow path
+
+buffer_px = 10  # pixels from edge — adjust if needed
+
+rows, cols = acc.shape
+edge_mask = np.zeros_like(acc, dtype=bool)
+
+# Top, bottom, left, right strips
+edge_mask[:buffer_px, :] = True
+edge_mask[-buffer_px:, :] = True
+edge_mask[:, :buffer_px] = True
+edge_mask[:, -buffer_px:] = True
+
+# Only keep cells that have actual accumulation data
+edge_mask = edge_mask & (acc > 0)
+
+print(f"Edge cells with flow: {edge_mask.sum():,}")
+```
+
+```{python}
+# ── 3. Find best pour point using combined score (high acc + low elevation) ──
+# Use nodata-adjacency boundary mask; fall back to edge buffer if needed
+candidate_mask = boundary_mask if boundary_mask.sum() > 0 else edge_mask
+print(f"Using {'boundary_mask' if boundary_mask.sum() > 0 else 'edge_mask'}: {candidate_mask.sum():,} candidate cells")
+
+if candidate_mask.sum() == 0:
+    raise RuntimeError("No candidate cells found — check exit_mask and edge_mask.")
+
+def safe_norm(arr):
+    """Normalize to [0, 1]; returns 0.5 everywhere if all values are equal."""
+    mn, mx = np.nanmin(arr), np.nanmax(arr)
+    if mx > mn:
+        return (arr - mn) / (mx - mn)
+    return np.where(np.isfinite(arr), 0.5, np.nan)
+
+# Normalize accumulation to [0, 1] on candidate cells — higher is better
+edge_acc  = np.where(candidate_mask, acc.astype(float), np.nan)
+norm_acc  = safe_norm(edge_acc)
+
+# Normalize elevation to [0, 1] on candidate cells, then invert — lower elev is better
+edge_elev = np.where(candidate_mask, elev, np.nan)
+norm_elev_inv = 1 - safe_norm(edge_elev)
+
+# Combined score — tune weights as needed (must sum to 1)
+w_acc, w_elev = 0.7, 0.3
+score = w_acc * norm_acc + w_elev * norm_elev_inv
+
+max_idx = np.unravel_index(np.nanargmax(score), score.shape)
+pour_row, pour_col = max_idx
+
+# Convert pixel to map coordinates
+pour_x = transform[2] + (pour_col + 0.5) * transform[0]
+pour_y = transform[5] + (pour_row + 0.5) * transform[4]
+
+print(f"Pour point pixel: row={pour_row}, col={pour_col}")
+print(f"Pour point coord: x={pour_x:.1f}, y={pour_y:.1f}")
+print(f"Edge accumulation: {int(acc[pour_row, pour_col]):,}")
+print(f"Edge elevation:    {elev[pour_row, pour_col]:.2f}")
+print(f"Combined score:    {score[pour_row, pour_col]:.4f}")
+```
+
+
+
+```{python}
+# ── 4. Save the pour point as a shapefile (WBT needs shp, not geojson) ──
+pour_shp    = os.path.join(data_dir, "pour_point_raw_b.shp")
+pour_snapped = os.path.join(data_dir, "pour_point_snapped_b.shp")
+
+pour_gdf = gpd.GeoDataFrame(
+    {"id": [1], "acc": [int(edge_acc[pour_row, pour_col])]},
+    geometry=[Point(pour_x, pour_y)],
+    crs=crs
+)
+pour_gdf.to_file(pour_shp)
+print("Saved raw pour point:", os.path.exists(pour_shp))
+```
+
+
+```{python}
+# ── 5. Snap the pour point using JensonSnapPourPoints ──
+ret = wbt.jenson_snap_pour_points(
+    pour_pts=pour_shp,
+    streams=d8_acc,       # snap to highest accumulation nearby
+    output=pour_snapped,
+    snap_dist=50          # search radius in map units (metres for UTM)
+)
+
+print("Return code:", ret)
+print("Snapped file exists?", os.path.exists(pour_snapped))
+```
+
+
+
+```{python}
+# ── 6. Read back the snapped point and also export as GeoJSON ──
+snapped_gdf = gpd.read_file(pour_snapped)
+print(snapped_gdf)
+
+pour_geojson = os.path.join(data_dir, "pour_point_snapped_b.geojson")
+snapped_gdf.to_file(pour_geojson, driver="GeoJSON")
+print("GeoJSON saved:", os.path.exists(pour_geojson))
+```
+
+
+
+```{python}
+# ── 7. Plot to verify it's on the edge ──
+fig, ax = plt.subplots(figsize=(10, 7))
+ax.imshow(np.log1p(acc), cmap='Blues', extent=[
+    transform[2], transform[2] + cols * transform[0],
+    transform[5] + rows * transform[4], transform[5]
+])
+
+# Plot the snapped pour point
+snapped_pt = snapped_gdf.geometry.iloc[0]
+ax.plot(snapped_pt.x, snapped_pt.y, 'r*', markersize=15, label='Snapped Pour Point')
+
+ax.set_title('Flow Accumulation + Snapped Pour Point')
+ax.legend()
+ax.axis('off')
+plt.tight_layout()
+plt.show()
+```
