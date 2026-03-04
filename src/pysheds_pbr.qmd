@@ -1,0 +1,191 @@
+```{python}
+import geopandas as gpd
+from joblib import Parallel, delayed
+import xarray as xr
+from xarray.core.dataarray import DataArray
+import networkx as nx
+import numpy as np
+import pandas as pd
+import rioxarray
+from shapely import remove_repeated_points
+from shapely.errors import GEOSException
+from shapely.geometry import shape, Point, LineString
+from shapely.ops import linemerge
+from skimage import morphology
+from sklearn import linear_model
+from tqdm import tqdm
+#import ruptures as rpt
+from pathlib import Path
+import argparse
+import json
+import math
+import rasterio as rasterio
+from rasterio import features
+from rasterio.mask import mask
+from rasterio.plot import show
+from rasterio.plot import show_hist
+#import odc.geo.xr
+import matplotlib.pyplot as plt
+import pysheds
+#from osgeo import gdal
+from pysheds.grid import Grid 
+import mplleaflet
+%matplotlib inline
+import pyproj
+from pysheds.view import Raster, ViewFinder
+import matplotlib.colors as colors
+pd.options.mode.chained_assignment
+print('successfully imported all packages')
+```
+
+# Reading in DEM
+```{python}
+grid = Grid.from_raster("/Users/dillencorlett/pbr/data/watershedDEM.tif")
+dem_sheds = grid.read_raster("/Users/dillencorlett/pbr/data/watershedDEM.tif")
+```
+
+Optional code to inspect DEM:
+```{python}
+dem_sheds.viewfinder
+```
+
+```{python}
+dem_sheds[dem_sheds == -999999.0] = 0
+```
+
+```{python}
+dem_view = grid.view(dem_sheds)
+
+#dem_view.viewfinder
+
+plt.imshow(grid.view(dem_view), cmap='terrain', zorder=1)
+```
+
+# Hydroconditioning
+Filling pits in DEM:
+```{python}
+pit_filled_dem = grid.fill_pits(dem_sheds)
+pits = grid.detect_pits(pit_filled_dem)
+assert not pits.any()
+```
+
+Filling depressions in DEM:
+```{python}
+flooded_dem = grid.fill_depressions(pit_filled_dem)
+depressions = grid.detect_depressions(flooded_dem)
+assert not depressions.any()
+```
+
+Resolving flats in DEM:
+```{python}
+inflated_dem = grid.resolve_flats(flooded_dem)
+flats = grid.detect_flats(inflated_dem)
+#assert not flats.any()
+```
+
+For some reason the code above returns an AssertionError, but plotting flats (as seen below) verifies that there are no (easily visible) flats remaining, so I think we can move on to flow direction.
+
+```{python}
+fig, ax = plt.subplots(figsize=(8,6))
+fig.patch.set_alpha(0)
+
+plt.imshow(flats, cmap='Greys_r', zorder=1)
+plt.title('Flats', size=14)
+plt.tight_layout()
+```
+
+Generating flow direction:
+```{python}
+fdir = grid.flowdir(inflated_dem)
+```
+
+Generating flow accumulation:
+```{python}
+acc = grid.accumulation(fdir)
+```
+
+Visual check of flow accumulation:
+```{python}
+fig, ax = plt.subplots(figsize=(8,6))
+fig.patch.set_alpha(0)
+im = ax.imshow(acc, zorder=2,
+               cmap='cubehelix',
+               norm=colors.LogNorm(1, acc.max()),
+               interpolation='bilinear')
+plt.colorbar(im, ax=ax, label='Upstream Cells')
+plt.title('Flow Accumulation', size=14)
+plt.tight_layout()
+```
+
+Importing the watershed boundary as a vector to clip the DEM to:
+
+```{python}
+watershed = gpd.read_file("/Users/dillencorlett/pbr/data/bartleson_watershed.geojson")
+```
+
+```{python}
+from scipy.ndimage import binary_erosion
+
+# Reproject watershed to match DEM CRS if needed
+watershed = watershed.to_crs(grid.crs.srs)
+```
+
+```{python}
+# Rasterize watershed polygon to match DEM grid (1 = inside, 0 = outside)
+watershed_mask = features.rasterize(
+    [geom for geom in watershed.geometry],
+    out_shape=grid.shape,
+    fill=0,
+    transform=grid.affine,
+    all_touched=False,
+    default_value=1,
+    dtype=np.uint8
+).astype(bool)
+```
+
+```{python}
+# Mask flow accumulation to watershed
+acc_masked = np.where(watershed_mask, acc, np.nan)
+
+# Visual check
+fig, ax = plt.subplots(figsize=(8, 6))
+im = ax.imshow(acc_masked, cmap='cubehelix',
+               norm=colors.LogNorm(1, np.nanmax(acc_masked)),
+               interpolation='bilinear')
+plt.colorbar(im, ax=ax, label='Upstream Cells')
+plt.title('Flow Accumulation (Clipped to Watershed)', size=14)
+plt.tight_layout()
+```
+
+```{python}
+# Get 1-cell-wide watershed boundary ring via erosion
+inner = binary_erosion(watershed_mask, structure=np.ones((3, 3)), border_value=0)
+boundary_ring = watershed_mask & ~inner
+```
+
+```{python}
+# Restrict candidates to likely stream cells (top 5% accumulation)
+valid_acc = acc_masked[np.isfinite(acc_masked)]
+stream_thresh = np.percentile(valid_acc, 95)
+candidates = boundary_ring & (acc_masked >= stream_thresh)
+
+# Fallback if threshold is too strict
+if not np.any(candidates):
+    candidates = boundary_ring & np.isfinite(acc_masked)
+
+# Pick boundary cell with max accumulation
+best_idx = np.nanargmax(np.where(candidates, acc_masked, np.nan))
+row, col = np.unravel_index(best_idx, acc_masked.shape)
+pour_acc = float(acc_masked[row, col])
+
+# Convert to geographic coordinates (cell center)
+x, y = rasterio.transform.xy(grid.affine, row, col)
+print(f"Estimated pour point at (x={x:.4f}, y={y:.4f}), accumulation={pour_acc:.0f} cells")
+```
+
+Save the outlet as a point GeoJSON:
+```{python}
+gdf = gpd.GeoDataFrame({"acc":[float(pour_acc)]}, geometry=[Point(x, y)], crs=grid.crs.srs)
+gdf.to_file("estimated_pour_point.geojson", driver="GeoJSON")
+```
+
